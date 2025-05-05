@@ -1,43 +1,66 @@
+import rashba as rs
+import conductivity as cnd
 import numpy as np
-from IPython.display import clear_output
-from numpy import sqrt, sin, cos, exp, log
-from numpy import pi as π
-from scipy.optimize import minimize_scalar
-import square as sq
-from time import time as t
-import math as m
-def swave_BSfactor(ω,Vd,ηs,N=100,reg=1e-4j,**kwargs):
-    ωreg=ω+ reg
-    kx,ky,mask = sq.findShell(20,N,**kwargs)
-    dA = 1/N**2
-    #Splitting kx,ky and Delta into smaller chunks to save memory
-    φd = sq.φvector(kx,ky,
-                    choose=np.array([False,True,False,False,False]))[:,0]
-    ξbar,δ,Eplus,Eminus = sq.energy_terms(kx,ky,ηs,**kwargs)
-    basickernel = (sq.fermi(Eplus,**kwargs)-sq.fermi(Eminus,**kwargs))/δ
-    kernel = basickernel/(ωreg**2-4*δ**2)  #(k,w)
-    Ld = dA*np.sum(φd**2*basickernel/2)
-    I2 = dA*np.sum(φd**2*kernel)
-    return -1/Vd-Ld+ωreg**2/2*I2
-def findMode(ηs,ηd,Vd,swave=True,**kwargs):
-    if swave:
-        dummy = lambda ω: abs(swave_BSfactor(ω,Vd,ηs,**kwargs))
-        ω0 = 0
+def minimalGap(kx,ky,η,**kwargs):
+    ξ0 = rs.ξsquarelattice(kx,ky,**kwargs)
+    γ = 0*np.linalg.norm(rs.γcoupling(kx,ky,**kwargs),axis=0)
+    shift = np.array([γ,-γ])
+    φ = rs.φsimplified(kx,ky)
+    Δ = np.array([np.dot(φ,η), np.dot(φ.conj(),η)])#2,k
+    δ = np.sqrt(ξ0**2+abs(Δ)**2)#2,k
+    #Get full spectrum of energies:
+    E = np.array([shift+δ,shift-δ]).reshape(4,len(kx))
+    Enegative = E.copy()
+    Enegative[E>0]*=-np.inf
+    Epositive = E.copy()
+    Epositive[E<0]*=-np.inf
+    allDifferences = Epositive[:,None,:]-Enegative[None,:,:]
+    return np.min(allDifferences)
+def findMinima(arr,cut=np.inf):
+    """
+    Takes a positive 1-d numpy array and identifies local minima within, with first and last elements excluded.
+    Returns the indices of the local minima within the array.
+    """
+    next = np.append(arr[1:],-1)  #Leaving out the first element
+    prev = np.insert(arr[:-1],0,-1) #Leaving out the last element
+    mincondition = (prev>arr) & (next>arr) &(arr<cut) #True for all indices where both the next and previous elements are larger
+    ind = np.asarray(mincondition).nonzero()[0]
+    return ind
+def findModes(V,η,ωmax, Nk=400,Nω=800,ωc=1,ωmin=None,cut=0.05,nmodes=10,**kwargs):
+    if ωmin==None:
+        ωmin = ωmax/50
+    ωarray = np.linspace(ωmin,ωmax,Nω)
+    σ,VeffInv,Q,Qm = cnd.σ_simplified(V,η,ωarray,N=Nk,ωc=ωc,**kwargs)
+    λ = abs(np.linalg.eigvals(VeffInv))
+    index= findMinima(np.min(λ,axis=1),cut=cut)
+    if len(index)>nmodes:
+        return ωarray[index][:nmodes]
     else:
-        ω0 =2*ηs
-        dummy = lambda ω: abs(mixedwave_factor(ω,ηs,ηd,**kwargs))
-    return minimize_scalar(dummy,ω0,bounds=(0,2*ηs))
-def mixedwave_factor(ω,ηs,ηd,N=100,reg=1e-4j,**kwargs):
-    ωreg=ω+ reg
-    kx,ky,mask = sq.findShell(20,N,**kwargs)
-    dA = 1/N**2
-    #Splitting kx,ky and Delta into smaller chunks to save memory
-    φd = sq.φvector(kx,ky,
-                    choose=np.array([False,True,False,False,False]))[:,0]
-    ξbar,δ,Eplus,Eminus = sq.energy_terms(kx,ky,ηs+1j*ηd*φd,**kwargs)
-    basickernel = (sq.fermi(Eplus,**kwargs)-sq.fermi(Eminus,**kwargs))/δ
-    kernel = basickernel/(ωreg**2-4*δ**2)  #(k,w)
-    I0 = dA*np.sum(kernel)
-    I2 = dA*np.sum(kernel*φd**2)
-    I4 = dA*np.sum(kernel*φd**4)
-    return I0*(ωreg**2/2-2*ηs**2)*(ωreg**2/2*I2-2*ηd**2*I4)-(2*ηs*ηd*I2)**2
+        missing = nmodes-len(index)
+        extra = np.array([ωmax]*missing)
+        frequencies = np.concatenate((ωarray[index],extra))
+        return frequencies
+def blockModes(V,η,m1,m2,ωmax,Nk=400,Nω=800,ωc=1,ωmin=None,**kwargs):
+    """
+    Same thing as findModes, but only for the two given modes.
+    """
+    if ωmin==None:
+        ωmin = ωmax/50
+    ωarray = np.linspace(ωmin,ωmax,Nω)
+    σ,VeffInv,Q,Qm = cnd.σ_simplified(V,η,ωarray,N=Nk,ωc=ωc,**kwargs)
+    block = VeffInv[:,
+        [
+            [m1,m1],
+            [m2,m2]
+        ],
+        [
+            [m1,m2],
+            [m1,m2]
+        ]
+    ]
+    λ = abs(np.linalg.eigvals(block))
+    index= findMinima(np.min(λ,axis=1))
+    if len(index)>0:
+        return ωarray[index][0]
+    else:
+        return 0

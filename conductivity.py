@@ -1,484 +1,366 @@
+import rashba as rs
 import numpy as np
-from IPython.display import clear_output
-from numpy import sqrt, sin, cos, exp, log
-from numpy import pi as π
-import square as sq
+import math
 from time import time as t
-import freeDispersion as fr
+from IPython.display import clear_output
 import math as m
-def calculate_σ(V,η,ω,N=100,ωc=1,**kwargs):
-    nonzero = (V!=0)
-    coupling = -np.concatenate((V[nonzero],V[nonzero]))
-    dof = len(coupling)    #Fluctuation degrees of freedom
-    kx,ky = sq.findShell(ωc,N,**kwargs)
-    #Restricting Delta from the full grid to the relevant shell
-    #Δshell = Δ[mask]
-    nk = len(kx)
-    nω = len(ω)
-    kchunks = m.ceil(nk/1e5)
-    dA = 1/N**2
-    #Splitting kx,ky and Delta into smaller chunks to save memory
-    kx_intervals = np.array_split(kx,kchunks)
-    ky_intervals = np.array_split(ky,kchunks)
-    #Δ_intervals = np.array_split(Δshell,kchunks)
-    σ_QP = np.zeros((nω,2,2))
-    Qminus = np.zeros((nω,2,dof),dtype=complex)
-    Q  = np.zeros((nω,2,dof),dtype=complex)
-    Π  = np.zeros((nω,dof,dof),dtype=complex)
-    for j in range(kchunks):
+CF = 1e-10
+
+def calculate_σ(V,Δ,ω,N=100,ωc=1,returnUinv=False,fullBZ=True,**kwargs):
+    kx_FS,ky_FS,plusShell,minusShell,mask = rs.findShells(N=N,ωc=ωc,**kwargs)
+    nω=len(ω)
+    ωchunks=1
+    while(nω>200):
+        nω//=2
+        ωchunks*=2
+    ω_intervals = np.split(ω,ωchunks)
+    #Only use components which have non-zero interaction strength
+    nonzero_coupling = (V!=0)
+    coupling = -V[nonzero_coupling]
+    coupling = np.concatenate((coupling,coupling))
+    nc = len(coupling)#Number of considered components
+    σ_quasiparticles=[]
+    Π=[]
+    Q=[]
+    Qminus = []
+    if fullBZ:  #sum over 2D grid, covering the entire BZ
+        #Create (N,N) Boolean Arrays describing the pairing shells
+        plusShellGrid = np.zeros_like(mask,dtype=bool)
+        plusShellGrid[mask]=plusShell
+        minusShellGrid = np.zeros_like(mask,dtype=bool)
+        minusShellGrid[mask] = minusShell
+        sharedShellGrid = minusShellGrid & plusShellGrid
+
+        #A boolean filter-array indicating allowed pairings: 
+        allowedPairing = np.zeros((N,N,nc,4,4),dtype=bool)
+        allowedPairing[:,:,:,[0,2],[2,0]]=plusShellGrid[:,:,None,None]
+        allowedPairing[:,:,:,[1,3],[3,1]]=minusShellGrid[:,:,None,None]
+        allowedPairing[:,:,:,[0,1,2,3],[3,2,1,0]]=sharedShellGrid[:,:,None,None]
+        dA = 1/N**2
+        k = np.linspace(-np.pi,np.pi,N,endpoint=False)
+        #Splitting into chunks:
+        nk=N
+        kchunks=1
+        #Divide array-length by 2 until it is below some managable limit (chosen as 200 because that seems to still work)
+        while(nk>200):
+            nk//=2
+            kchunks*=2
+        
+        k_intervals = np.split(k,kchunks)
+
+        #Splitting the gap-function along y-direction first
+        Δchunks = np.array(np.split(Δ,kchunks,axis=-3))
+        #And then along x:
+        Δchunks = np.array(np.split(Δchunks,kchunks,axis=-4))
+        print(np.shape(Δchunks))
+        allowedPairingchunks = np.array(np.split(allowedPairing,kchunks,axis=-4))
+        allowedPairingchunks = np.array(np.split(allowedPairingchunks,kchunks,axis=-5))
+       
+        for l,ω_interval in enumerate(ω_intervals):
+            σ_QP_sum = np.zeros((nω,2,2))
+            Π_sum = np.zeros((nω,nc,nc),dtype=complex)
+            Q_sum = np.zeros((nω,2,nc),dtype=complex)
+            Qm_sum = np.zeros((nω,2,nc),dtype=complex)
+            for i,kx_interval in enumerate(k_intervals):
+                for j,ky_interval in enumerate(k_intervals):
+                    print(f"Frequency interval {l+1} of {ωchunks}")
+                    print(f"k_x interval {i+1} of {kchunks}")
+                    print(f"k_y interval {j+1} of {kchunks}")
+                    clear_output(wait=True)
+                    σ_QP_chunk,Π_chunk,Q_chunk,Qm_chunk = calculate_chunk(
+                        kx_interval[:,None]+0*ky_interval[None,:],
+                        ky_interval[None,:]+0*kx_interval[:,None],
+                        Δchunks[i,j,...],
+                        ω_interval,
+                        dA,
+                        allowedPairingchunks[i,j,...],
+                        nonzeroPairing=nonzero_coupling,
+                        **kwargs
+                    )
+                    σ_QP_sum+=σ_QP_chunk
+                    Π_sum+=Π_chunk
+                    Q_sum+=Q_chunk
+                    Qm_sum+=Qm_chunk
+            σ_quasiparticles.append(σ_QP_sum)
+            Π.append(Π_sum)
+            Q.append(Q_sum)        
+            Qminus.append(Qm_sum)
+        #End of Frequency-loop for the Full BZ case
+    else:   #Just use energy-shells around the Fermi surface
+
+        #Calculating the relevant momenta around the fermi-surface
+        Δshell = Δ[mask]
+        nk = len(kx_FS)
+        sharedShell = plusShell & minusShell
+        allowedPairing = np.zeros((nk,nc,4,4),dtype=bool)
+        allowedPairing[:,:,[0,2],[2,0]]=plusShell[:,None,None]
+        allowedPairing[:,:,[1,3],[3,1]]=minusShell[:,None,None]
+        allowedPairing[:,:,[0,1,2,3],[3,2,1,0]]=sharedShell[:,None,None]
+        kchunks = math.ceil(nk/40000)# Split into intervals that are at most 40000 elements long
+        dA = 1/N**2
+        kx_intervals = np.array_split(kx_FS,kchunks)
+        ky_intervals = np.array_split(ky_FS,kchunks)
+        Δ_intervals = np.array_split(Δshell,kchunks)
+        pairing_intervals = np.array_split(allowedPairing,kchunks)
+        for i,ω_interval in enumerate(ω_intervals):
+            σ_QP_sum = np.zeros((nω,2,2))
+            Π_sum = np.zeros((nω,nc,nc),dtype=complex)
+            Q_sum = np.zeros((nω,2,nc),dtype=complex)
+            Qm_sum = np.zeros((nω,2,nc),dtype=complex)
+            for j in range(kchunks):
+                print(f"Frequency interval {i+1} of {ωchunks}")
                 print(f"Momentum interval {j+1} of {kchunks}")
-                #clear_output(wait=True)
+                clear_output(wait=True)
                 σ_QP_chunk,Π_chunk,Q_chunk,Qm_chunk = calculate_chunk(
                     kx_intervals[j],
                     ky_intervals[j],
-                    #Δ_intervals[j],
-                    η,
-                    ω,
+                    Δ_intervals[j],
+                    ω_interval,
                     dA,
-                    nonzero,
+                    pairing_intervals[j],
+                    nonzeroPairing=nonzero_coupling,
                     **kwargs
                 )
-                σ_QP+=σ_QP_chunk
-                Π+=Π_chunk
-                Q+=Q_chunk
-                Qminus+=Qm_chunk
+                σ_QP_sum+=σ_QP_chunk
+                Π_sum+=Π_chunk
+                Q_sum+=Q_chunk
+                Qm_sum+=Qm_chunk
+            σ_quasiparticles.append(σ_QP_sum)
+            Π.append(Π_sum)
+            Q.append(Q_sum)        
+            Qminus.append(Qm_sum)
+    σ_quasiparticles = np.array(σ_quasiparticles).reshape(len(ω),2,2)
+    Π = np.array(Π).reshape(len(ω),nc,nc)
+    Q =np.array(Q).reshape(len(ω),2,nc)
+    Qminus = np.array(Qminus).reshape(len(ω),2,nc)
     Ueffinv = np.diag(1/coupling)[None,...]-Π
     Ueff = np.linalg.inv(Ueffinv)
     σ_collective = np.einsum(
         'wap,wpq,wbq->wab',
         Q,Ueff,Qminus
     )
-    σ_collective = (0.25j*σ_collective/ω[:,None,None]).real
-    return σ_QP,σ_collective,Ueffinv,Q,Qminus
-def calculate_chunk(kx,ky,η,ω,dA,nonzero_coupling,reg=1e-3j,**kwargs):
-    """
+    σ_collective = (0.5j*σ_collective/ω[:,None,None]).real
+    if returnUinv:
+        return σ_quasiparticles,σ_collective,Ueffinv,Q,Qminus
+    else:
+        return σ_quasiparticles,σ_collective
+def calculate_chunk(kx,ky,Δ,ω,dA,allowedPairing,nonzeroPairing,**kwargs):
+    #Always use ... for the momentum axes, which could be 1 or 2
+    kdimension = len(np.shape(kx))
+    if kdimension==1:
+        kstring = "K"
+        newk_axes = (None,)
+    else:
+        kstring="XY"
+        newk_axes = (None,None)
     #Basic ingredients:
-    s1 = t()
-    velocity = sq.vel(kx,ky,**kwargs) #(*K,2)
-    #velocity = np.array([[velocity,0*velocity],[0*velocity,velocity]]).transpose((2,3,0,1)) #(*k,x/y,2,2)
-    Yarray = sq.Ytensor(kx,ky,choose=nonzero_coupling)   #(*Kdims,6,2,2)
+    k_axes = [3+i for i in range(kdimension)]
+    velocity = np.transpose(
+        rs.vel(np.array([kx,ky]),**kwargs),
+        (*k_axes,0,1,2)) #(*Kdims,x/y,4,4)
+    Yarray = rs.Ytensor(kx,ky,nonzeroPairing=nonzeroPairing,**kwargs)   #(*Kdims,nc,4,4)
+    Yarray[~allowedPairing]=0   #Turn of fluctuations in the forbidden pairing range
 
-    H = sq.HBdG(kx,ky,Δ,**kwargs)#(*Kdims,2,2)
-    E,Vmatrix = np.linalg.eigh(H)     #(*Kdims,2) and (*Kdims,2,2), respectively
-    Vdagger = Vmatrix.conj().swapaxes(-1,-2)
+    H = rs.HBdG(kx,ky,Δ,**kwargs)#(*Kdims,4,4)
+    E,V = np.linalg.eigh(H)     #(*Kdims,4) and (*Kdims,4,4), respectively
+    Vdagger = V.conj().swapaxes(-1,-2)
 
     #Basic quantities
     E_dif = E[...,:,None]-E[...,None,:] # (*Kdims,i,j)
-    Fermi = sq.fermi(E,**kwargs)
+    Fermi = rs.fermi(E,**kwargs)
     Fermi_dif = Fermi[...,:,None]-Fermi[...,None,:] #(*kdims,i,j)
     #Actually the product of propagator and the fermi-difference
-    propagator = Fermi_dif[...,None,:,:]/(ω[None,:,None,None]+E_dif[...,None,:,:]+reg) #(*k,w,i,j)
-    propagator_neg = Fermi_dif[...,None,:,:]/(-ω[None,:,None,None]+E_dif[...,None,:,:]-reg) #(*k,w,i,j)
+    propagator = Fermi_dif[...,None,:,:]/(ω[*newk_axes,:,None,None]+E_dif[...,None,:,:]+1j*CF) #(*kdimgs,w,i,j)
+    propagator_neg = Fermi_dif[...,None,:,:]/(-ω[*newk_axes,:,None,None]+E_dif[...,None,:,:]+1j*CF) #(*kdims,w,i,j)
     #Transform the basis-function-tensor into the diagonal basis
-    Yarray = (Vdagger[:,None,...]) @ Yarray @ (Vmatrix[:,None,...]) #(*k,6,2,2)
+    Yarray = (Vdagger[...,None,:,:]) @ Yarray @ (V[...,None,:,:]) #(*k,14,4,4)
     #Transform the velocity-array
-    velocity = (Vdagger[:,None,...]) @ velocity @ (Vmatrix[:,None,...])#(*k,x/y,2,2)
+    velocity = (Vdagger[...,None,:,:]) @ velocity @ (V[...,None,:,:])#(*k,x/y,4,4)
+
 
     #Summing over momentum and other d.o.f's
     σ_quasiparticles = dA*np.einsum(
-        "Kwij,Kaij,Kbji->wab",
+        f"{kstring}wij,{kstring}aij,{kstring}bji->wab",
         propagator,velocity,velocity
     )
     σ_quasiparticles = (1j*σ_quasiparticles/(ω[:,None,None])).real
     Π = dA/2*np.einsum(
-        'Kwij,Kpqij->wpq',
-        propagator,Yarray[:,:,None,:,:]*(Yarray[:,None,:,:,:].swapaxes(-1,-2))
+        f'{kstring}wij,{kstring}pqij->wpq',
+        propagator,Yarray[...,:,None,:,:]*(Yarray[...,None,:,:,:].swapaxes(-1,-2))
     )    
     Q = dA*np.einsum(
-        'Kwij,Kapij->wap',
+        f'{kstring}wij,{kstring}apij->wap',
         propagator,
-        velocity[:,:,None,:,:]*(Yarray[:,None,:,:,:].swapaxes(-1,-2))
+        velocity[...,:,None,:,:]*(Yarray[...,None,:,:,:].swapaxes(-1,-2))
     )
     Qminus = dA*np.einsum(
-        'Kwij,Kapij->wap',
+        f'{kstring}wij,{kstring}apij->wap',
         propagator_neg,
-        velocity[:,:,None,:,:]*(Yarray[:,None,:,:,:].swapaxes(-1,-2))
+        velocity[...,:,None,:,:]*(Yarray[...,None,:,:,:].swapaxes(-1,-2))
     )
-    e1 = t()
-    """
-    ###ALTERNATIVE APPROACH:
-    s2=t()
-    v3 = sq.v3(kx,ky,**kwargs)  #(*k,x/y)
-    φ_array = sq.φvector(kx,ky,choose=nonzero_coupling) #(*k,dof/2)-array
-    η_nonzero = η[nonzero_coupling]
-    Δ = np.dot(φ_array,η_nonzero)
-    ξbar,δ,Eplus,Eminus = sq.energy_terms(kx,ky,Δ,**kwargs) #All (*k)-arrays
-    
-    kernelnumerator = sq.fermi(Eplus,**kwargs)-sq.fermi(Eminus,**kwargs)
-    kernel = δ[:,None]*((ω[None,:]+reg)**2-4*(δ[:,None])**2)
-    kernel_M = δ[:,None]*((-ω[None,:]-reg)**2-4*(δ[:,None])**2)
-    kernel = kernelnumerator[:,None]/kernel #(*k,w)-array
-    kernel_M = kernelnumerator[:,None]/kernel_M #(*k,w)-array
-    Φ = -4*dA*np.einsum(
-          'Kw,Ka,Kb->wab',
-          kernel*abs(Δ[:,None])**2,v3,v3
-    )
-    Φ= (1j*Φ/(2*ω[:,None,None])).real
-
-    
-    
-    #Defining the integrand WITHOUT THE FREQUENCY-FACTOR on the off-diagonal (to save memory)
-    #Frequency needs to be appropriately multiplied in, after momentum is integrated out.
-    ΠmatrixIntegrand1 = np.array([
-          [-4*ξbar**2-4*(Δ.imag)**2,
-           -4*Δ.real*Δ.imag],
-          [-4*Δ.real*Δ.imag,
-           -4*ξbar**2-4*(Δ.real)**2]
-    ]).transpose((2,0,1))  #(*k,2,2)-array
-
-    ΠmatrixIntegrand2 = np.array([
-          [np.zeros_like(ξbar),
-           2j*ξbar*(1)],
-          [-2j*ξbar*(1),
-           np.zeros_like(ξbar)]
-    ]).transpose((2,0,1))  #(*k,2,2)-array
-
-    dof = len(nonzero_coupling[nonzero_coupling])*2
-
-    #ΠmatrixIntegrand = ΠmatrixIntegrand[:,:,:,None,:,None]*φ_arraysquared[:,None,None,:,None,:]    #(*k,w,2,dof/2,2,dof/2)
-    #ΠmatrixIntegrand = ΠmatrixIntegrand.reshape(*np.shape(kernel),dof,dof) #(*k,w,dof,dof)-array
-
-    Πalt = dA/2*np.einsum('Kipjq,Kw->wipjq',
-        ΠmatrixIntegrand1[:,:,None,:,None]*φ_array[:,None,:,None,None]*φ_array[:,None,None,None,:],
-        kernel)
-    #Second array, containing terms that need to be multiplied with the frequency after integration:
-    Πalt2 = dA/2*np.einsum('Kipjq,Kw->wipjq',
-        ΠmatrixIntegrand2[:,:,None,:,None]*φ_array[:,None,:,None,None]*φ_array[:,None,None,None,:],
-        kernel)
-    #The missing frequency-factors:
-    ωfactor = np.array([
-          [0*ω+1,ω+reg],
-          [ω+reg,0*ω+1]
-    ]).transpose((2,0,1))#(w,2,2)
-    #Adding both terms:
-    Πalt = Πalt + Πalt2 * ωfactor[:,:,None,:,None]
-    #Combining the mu and nu dimensions:
-    Πalt = Πalt.reshape((len(ω),dof,dof))
-
-    #Again, first defining everything without frequency-factors
-    QvectorIntegrand1 = np.array(
-          [4*Δ.real*ξbar,
-           4*Δ.imag*ξbar]).transpose((1,0))#(*k,2)
-    QvectorIntegrand1 = QvectorIntegrand1[:,None,:,None]*v3[:,:,None,None]*φ_array[:,None,None,:] #(*k,x/y,2,dof/2)
-    
-    QvectorIntegrand2 = np.array(
-          [-2j*Δ.imag*(1),
-           -2j*Δ.real*(1)]).transpose((1,0))#(*k,2)
-    QvectorIntegrand2 = QvectorIntegrand2[:,None,:,None]*v3[:,:,None,None]*φ_array[:,None,None,:] #(*k,x/y,2,dof/2)
-    
-    #Terms that aren't proportional to frequency
-    Qalt = dA*np.einsum('Kaip,Kw->waip',QvectorIntegrand1,kernel)
-    Qalt_M = dA*np.einsum('Kaip,Kw->waip',QvectorIntegrand1,kernel_M)
-    #Terms that are proportional to frequency:
-    Qalt_f = dA*np.einsum('Kaip,Kw->waip',QvectorIntegrand2,kernel)
-    Qalt_M_f = dA*np.einsum('Kaip,Kw->waip',QvectorIntegrand2,kernel_M)
-
-    #Re-introducing the missing frequency-factors:  
-    ωfactor = np.array([ω+reg,ω+reg]).transpose((1,0)) #(w,2)
-    Qalt = Qalt+Qalt_f*ωfactor[:,None,:,None]
-    #For negative frequencies:
-    ωfactor = np.array([-ω-reg,-ω-reg]).transpose((1,0)) #(w,2)
-    Qalt_M = Qalt_M+Qalt_M_f*ωfactor[:,None,:,None]
-
-    #Reshaping
-    Qalt = Qalt.reshape((len(ω),2,dof))
-    Qalt_M = Qalt_M.reshape((len(ω),2,dof))#(*k,x/y,dof)
-    e2 = t()
-    """
-    #COMPARING:
-
-    print("Quasiparticle conductivity difference: ",np.max(abs(Φ-σ_quasiparticles)))
-    print("Π00 difference: ",np.max(abs(Π-Πalt)[:,0:5,0:5]))
-    print("Π10 difference: ",np.max(abs(Π-Πalt)[:,5:,0:5]))
-    print("Π01 difference: ",np.max(abs(Π-Πalt)[:,0:5,5:]))
-    print("Π11 difference: ",np.max(abs(Π-Πalt)[:,5:,5:]))
-    print("Q difference: ",np.max(abs(Q-Qalt)))
-    print("Q_m difference: ",np.max(abs(Qminus-Qalt_M)))
-    print("Original method: ",e1-s1," seconds.")
-    print("New method: ", e2-s2, " seconds.")
-    """
-    return Φ,Πalt,Qalt,Qalt_M
-    #return σ_quasiparticles,Π,Q,Qminus
+    return σ_quasiparticles,Π,Q,Qminus
 def collective_σ(Ueffinv,Q,Qminus,ω):
     Ueff = np.linalg.inv(Ueffinv)
     σ_collective = np.einsum(
         'wap,wpq,wbq->wab',
         Q,Ueff,Qminus
     )
-    σ_collective=(0.25j*σ_collective/ω[:,None,None]).real
+    σ_collective=(0.5j*σ_collective/ω[:,None,None]).real
     return σ_collective
-
-####Alternative functions, specifically for ONLY s+id order parameters
-#Calculate 9 Integrals and build everything from those
-def σ_simplified(Vs,Vd,ηs,ηd,ω,**kwargs):
+def σ_simplified(V_in,η,ω,ωc=10,**kwargs):
     """
-    Calculate the optical conductivity of the simple one-band model. Takes scalars Vs,Vd,ηs,ηd
-    and an array of frequencies ω. All additional keyword arguments are passed on to polarizationbubbles.
+    Conductivity for a rashba-system with ONLY interband pairing, including s- and p-wave contributions.
     """
-    Vd*=-1
-    Vs*=-1
-    Φ,Π,Q,Qm =polarizationBubbles(ηs,ηd,ω,**kwargs)
+    #Multiply V with -1 to get the attractive potential.
+    V = -V_in
+    kx,ky = rs.findShell(ωc=ωc,**kwargs)
+    #Calculate all polarization bubbles of the outer and inner block of the Green's function
+    Φout,Πout,Qout,Qmout =simpleBubbles(η,ω,sign=1,ωc=ωc, **kwargs)
+    Φin,Πin,Qin,Qmin =simpleBubbles(η,ω,sign=-1,ωc=ωc,**kwargs)
+    Φ = Φin  + Φout
+    Π = Πin  + Πout
+    Q = Qin  + Qout
+    Qm= Qmin + Qmout
     σQP = -0.5*(Φ/ω[:,None,None]).imag
-    VeffInv = np.diag([1/Vd,1/Vs,1/Vd,1/Vs])[None,:,:]-Π/2
+    VeffInv = np.diag(
+        np.concatenate((1/V,1/V))
+    )[None,:,:]-Π/2
     Veff = np.linalg.inv(VeffInv)
-    σ_collective = np.einsum('wap,wpq,wbq->wab',Q,Veff,Qm)
+    σ_collective = np.einsum('wap,wpq,wbq->wab',Qm,Veff,Q)
     σ_collective = -0.25*(σ_collective/ω[:,None,None]).imag
-    return σQP,σ_collective,VeffInv,Q,Qm
-def σ_bilayer(Vs,Vd,ηs,ηd,ω,J=0,μ=0,**kwargs):
-    """
-    Calculate conductivity for the bilayer system. Vs and Vd should be the 2x2-pairing matrices, 
-    ηs,ηd the corresponding 2-vector gaps. ω should be an array of frequencies as usual.
-    Returns 3 tuples, for band 1, band 2 and the interband-contribution, respectively.
-    Each Tuple contains the optical conductivity, the inverse effective coupling, Q(ω) and Q(-ω)
-    for the respective contribution.
-    """
-    #Construct the V matrices:
-    VarrInv = np.linalg.inv(np.array([-Vd,-Vs])) #(2,2,2)-array
-    pairing11 = np.kron(np.eye(2),np.diag(VarrInv[:,0,0]))
-    pairing22 = np.kron(np.eye(2),np.diag(VarrInv[:,1,1]))
-    pairing12 = np.kron(np.eye(2),np.diag(VarrInv[:,0,1]))
-    pairing21 = np.kron(np.eye(2),np.diag(VarrInv[:,1,0]))
-    #Varr = np.concatenate((Varr,Varr),axis=0) #μ,α,β
-    pairingBlock = np.array([
-         [pairing11,pairing12],
-         [pairing21,pairing22]
-    ]).transpose((0,2,1,3)).reshape(8,8)
-    #Calculate the polarizationbubbles via integration over the BZ. Each Band is simply a cosine-band
-    #shifted by +-J, so the previous functions can be reused.
-    if type(ηs[0])!=np.complex128:
-        #If the gap components are real numbers, it is assumed that the gap is of s+id type
-        Φ1, Π1, Q1, Qm1 = polarizationBubbles(ηs[0],ηd[0],ω,μ=μ+J,**kwargs)
-        Φ2, Π2, Q2, Qm2 = polarizationBubbles(ηs[1],ηd[1],ω,μ=μ-J,**kwargs)
-    else:
-        #For a general gap, the components are complex. Then, the general function is used.
-        Φ1, Π1, Q1, Qm1 = complexPolarizationBubbles(ηs[0],ηd[0],ω,μ=μ+J,**kwargs)
-        Φ2, Π2, Q2, Qm2 = complexPolarizationBubbles(ηs[1],ηd[1],ω,μ=μ-J,**kwargs)
-    o=np.zeros_like(Π1)
-    Π =  np.array([
-         [Π1,o],
-         [o,Π2]
-    ]).transpose((2,0,3,1,4)).reshape((len(ω),8,8))
-    Q = np.concatenate((Q1,Q2),axis=-1)
-    Qm = np.concatenate((Qm1,Qm2),axis=-1)
-    #Calculate the intraband contributions:
-        #Band 1:
-    σQP1 = -0.5*(Φ1/ω[:,None,None]).imag
-        #Band 2:
-    σQP2 = -0.5*(Φ2/ω[:,None,None]).imag
-    #Calculate the fluctuation/interband contributions:
-    #Creating a block matrix: 8x8, with the outer block corresponding to bands a and b
-    #Π = np.einsum('mga,nbg,gwmn->wambn',Varr,Varr,Π).reshape((len(ω),8,8))
-    
-    
-    VeffInv = pairingBlock[None,...]-Π/2
-    #transpose moves rows of outer matrix in front of rows for inner matrix, so reshape has the desired effect
-    Veff = np.linalg.inv(VeffInv)
-
-    #Creating the updated Q-vector:
-    #Q = np.einsum('mga,gwjm->wjam',Varr,Q).reshape((len(ω),2,8))
-    #Qm = np.einsum('mag,gwjm->wjam',Varr,Qm).reshape((len(ω),2,8))
-    σ_coll = np.einsum('wap,wpq,wbq->wab',Q,Veff,Qm)
-    σ_coll = -0.25*(σ_coll/ω[:,None,None]).imag
-
-    return σQP1+σQP2,σ_coll,VeffInv,Q,Qm
-
-#Calculate basic Integrals and build everything from those
-def polarizationBubbles(ηs,ηd,ω,N=100,ωc=20,reg=1e-4j,use="square",**kwargs):
-    """
-    Calculates the 4 polarization bubbles of one cosine-band.
-    ηs,ηd are real scalars describing the amplitude of s and id gap-components.
-    ω is an array of frequencies.
-    Returns Φ(ω): (ω,x/y,x/y)-array (last 2 axes are conductivity-components)
-    Π(ω): (ω,4,4)-array, last 2 axes are fluctuation-components (d,s,id,is)
-    Q(ω) and Q(-ω): (ω,x/y,4)-array. Second axis is spatial direction, 3rd axis are fluctuations.
-    This function uses formulas simplified specifically for an s+id gap, which is why the gap components
-    are treated as real. For a more general function, see complexPolarizationBubbles, 
-    which yields equivalent results but takes a little longer, due to treating the components as complex numbers.
-    """
-    if use=="square":
-        file = sq
-    elif use=="free":
-         file = fr
-    else: raise ValueError("Only able to use 'free' or 'square'.")
+    return σQP+σ_collective,VeffInv,Q,Qm
+def simpleBubbles(η,ω,N=400,reg=1e-4j,**kwargs):
     ωreg = ω+reg
-    kx,ky = file.findShell(ωc,N,**kwargs)
-    nk = len(kx)
-    nω = len(ω)
-    kchunks = m.ceil(nk/2e5)
-    dA = 1/N**2
-    #Splitting kx,ky and Delta into smaller chunks to save memory
-    kx_intervals = np.array_split(kx,kchunks)
-    ky_intervals = np.array_split(ky,kchunks)
-
-    integrals = np.zeros((8,nω),dtype=complex) #Stores the 5 scalar integrals
-    vector_integrals = np.zeros((6,nω,2),dtype=complex) #Stores the 4 vector integrals
-    Φintegral = np.zeros((nω,2,2),dtype=complex)
-    Ld = 0
-    Ls = 0
-    Ld1 =0
-    for j in range(kchunks):
-        print(f"Momentum interval {j+1} of {kchunks}")
-        #clear_output(wait=True)
-        Ichunk,vIchunk,Φchunk,LdChunk,LsChunk,Ld1Chunk=chunk_simplified(
-              kx_intervals[j],ky_intervals[j],ηs,ηd,ωreg,dA,file,**kwargs
-         )
-        integrals+=Ichunk
-        vector_integrals+=vIchunk
-        Φintegral+=Φchunk
-        Ld+=LdChunk
-        Ls+=LsChunk
-        Ld1+=Ld1Chunk
-    #Construct relevant objects:
-    Φintegral*=-4
-    I0, I2, I4, Iξd, Iξ, Iξdd,I1,I3 = integrals
-    Q1, Q2, Q3, Q4, Q5, Q6 = vector_integrals #all (w,2)
-    o = np.zeros_like(I4)
-    #Inserting results from analytical simplifications.
-    #The function complexPolarizationBubbles is more readable, and more general
-    #  (but a little slower) in these calculations
-    Π = -2*np.array([
-         [-Ld+(ωreg**2/2-2*ηs**2)*I2,
-          -Ld1+(ωreg**2/2-2*ηs**2)*I1,
-          -1j*ωreg*Iξdd+2*ηs*ηd*I3,
-          2*ηs*ηd*I2-1j*ωreg*Iξd],
-
-         [-Ld1+(ωreg**2/2-2*ηs**2)*I1,
-          -Ls+(ωreg**2/2-2*ηs**2)*I0,
-          2*ηs*ηd*I2-1j*ωreg*Iξd,
-          -1j*ωreg*Iξ+2*ηs*ηd*I1],
-
-         [1j*ωreg*Iξdd+2*ηs*ηd*I3,
-          2*ηs*ηd*I2+1j*ωreg*Iξd,
-          -Ld+ωreg**2/2*I2-2*ηd**2*I4,
-          -Ld1+ωreg**2/2*I1-2*ηd**2*I3],
-
-         [2*ηs*ηd*I2+1j*ωreg*Iξd,
-          1j*ωreg*Iξ+2*ηs*ηd*I1,
-          -Ld1+ωreg**2/2*I1-2*ηd**2*I3,
-          -Ls+ωreg**2/2*I0-2*ηd**2*I2]
-    ]).transpose(2,0,1)
-    Q = np.array([
-         4*ηs*Q5-2j*ωreg[:,None]*ηd*Q1,
-         4*ηs*Q2-2j*ωreg[:,None]*ηd*Q6,
-         -4*ηd*Q3-2j*ωreg[:,None]*ηs*Q6,
-         -4*ηd*Q5-2j*ωreg[:,None]*ηs*Q4,
-    ]).transpose(1,2,0)
-    Qm = np.array([
-         4*ηs*Q5+2j*ωreg[:,None]*ηd*Q1,
-         4*ηs*Q2+2j*ωreg[:,None]*ηd*Q6,
-         -4*ηd*Q3+2j*ωreg[:,None]*ηs*Q6,
-         -4*ηd*Q5+2j*ωreg[:,None]*ηs*Q4,
-    ]).transpose(1,2,0)
-    return Φintegral,Π,Q,Qm
-def chunk_simplified(kx,ky,ηs,ηd,ω,dA,file,**kwargs):
-    """
-    Calculates all the relevant integrals. The frequency-array should already contain +iδ.
-    """
-    v3 = file.v3(kx,ky,**kwargs)
-    φd = file.φvector(kx,ky,choose=np.array([False,True,False,False,False]))[:,0] #(*k,dof/2)-array
-    Δ = φd*1j*ηd+ηs
-    ξbar,δ,Eplus,Eminus = file.energy_terms(kx,ky,Δ,**kwargs) #All (*k)-arrays
-    basickernel = (file.fermi(Eplus,**kwargs)-file.fermi(Eminus,**kwargs))/δ
-    kernel = basickernel[:,None]/((ω[None,:])**2-4*(δ[:,None])**2)  #(k,w)
-    I0 = dA*np.einsum('kw->w',kernel)   #w
-    I2 = dA*np.einsum('kw,k->w',kernel,φd**2)   #w
-    I4 = dA*np.einsum('kw,k->w',kernel,φd**4)   #w
-    Iξd = dA*np.einsum('kw,k->w',kernel,ξbar*φd)
-    Iξ = dA*np.einsum('kw,k->w',kernel,ξbar)
-    Iξdd = dA*np.einsum('kw,k->w',kernel,ξbar*φd**2)
-    Ld1 = dA*np.sum(φd*basickernel)/2
-    I1 = dA*np.einsum('kw,k->w',kernel,φd)
-    I3 = dA*np.einsum('kw,k->w',kernel,φd**3)
-    Ld = dA*np.sum(φd**2*basickernel)/2
-    Ls = dA*np.sum(basickernel)/2
-    Φintegral = dA*np.einsum('kw,ka,kb->wab',kernel*abs(Δ[:,None])**2,v3,v3)
-    Qint1 = dA*np.einsum('kw,ka->wa',kernel*(φd[:,None])**2,v3)
-    Qint2 = dA*np.einsum('kw,ka->wa',kernel*(ξbar[:,None]),v3)
-    Qint3 = dA*np.einsum('kw,ka->wa',kernel*(φd**2*ξbar)[:,None],v3)
-    Qint4 = dA*np.einsum('kw,ka->wa',kernel,v3)
-    Qint5 = dA*np.einsum('kw,ka->wa',kernel*(φd*ξbar)[:,None],v3)
-    Qint6 = dA*np.einsum('kw,ka->wa',kernel*(φd)[:,None],v3)
-    return np.array([I0,I2,I4,Iξd,Iξ,Iξdd,I1,I3]),np.array([Qint1,Qint2,Qint3,Qint4,Qint5,Qint6]),Φintegral,Ld,Ls,Ld1
-def complexPolarizationBubbles(ηs,ηd,ω,N=100,ωc=20,reg=1e-4j,use="square",**kwargs):
-    """
-    Calculates the 4 polarization bubbles of one cosine-band, for the case where 
-    ηs,ηd may be complex scalars.
-    ω is an array of frequencies.
-    Returns Φ(ω): (ω,x/y,x/y)-array (last 2 axes are conductivity-components)
-    Π(ω): (ω,4,4)-array, last 2 axes are fluctuation-components (d,s,id,is)
-    Q(ω) and Q(-ω): (ω,x/y,4)-array. Second axis is spatial direction, 3rd axis are fluctuations.
-    """
-    print("Interpreting ηs,ηd as complex amplitudes!")
-    ωreg = ω+reg
-    kx,ky = sq.findShell(ωc,N,**kwargs)
+    kx,ky = rs.findShell(N=N,**kwargs)
     nk = len(kx)
     nω = len(ω)
     kchunks = m.ceil(nk/5e4)
-    dA = 1/N**2
+    #I'm still unsure about if this should be 1/N^2 or 1/nk:
+    dA = 1/nk
     #Splitting kx,ky and Delta into smaller chunks to save memory
     kx_intervals = np.array_split(kx,kchunks)
     ky_intervals = np.array_split(ky,kchunks)
-    integrals = np.zeros((5,3,nω),dtype=complex)
-    vectorIntegrals = np.zeros((4,2,nω,2),dtype=complex)
+    integrals = np.zeros((5,6,nω),dtype=complex)
+    vectorIntegrals = np.zeros((4,3,nω,2),dtype=complex)
     Φintegral = np.zeros((nω,2,2),dtype=complex)
+    #ζ = np.zeros((nω,2),dtype=complex)
+    #otherIntegrals = np.zeros((4,3,nω),dtype=complex)
     for j in range(kchunks):
         print(f"Momentum interval {j+1} of {kchunks}")
         #clear_output(wait=True)
-        Ichunk,vIchunk,Φchunk=complexChunks(
-              kx_intervals[j],ky_intervals[j],ηs,ηd,ωreg,dA,**kwargs
+        Ichunk,vIchunk,Φchunk=simplechunks(
+              kx_intervals[j],ky_intervals[j],η,ωreg,dA,**kwargs
          )
         integrals+=Ichunk
         vectorIntegrals+=vIchunk
         Φintegral+=Φchunk
+        #ζ += ζchunk
+        #otherIntegrals += oIchunk
     Φintegral*=-4
+    #ζ*=-4
     Iξξ,Iξ,Iii,Iri,Irr = integrals
+    #Ii,Ir,Irξ,Iiξ = otherIntegrals
     QR,QI,QRξ,QIξ = vectorIntegrals
     
     #Creating the ν-indices of Π first (to later become the outer indices of the 4x4 matrix)
     Π = np.array([
          [-4*Iξξ-4*Iii,2j*ωreg*Iξ-4*Iri],
          [-2j*ωreg*Iξ-4*Iri,-4*Iξξ-4*Irr]
-    ]).transpose((2,0,1,3))#(3,ν,ν',w)
+    ]).transpose((2,0,1,3))#(6,ν,ν',w)
     
-    #The first axis contains the combinations d^2,ds,s^2
+    #The first axis contains the combinations s^2,sp_x,sp_y,p_x^2,p_xp_y,p_y^2
     #Arrange these combinations appropriately into the μ,μ'-indices.
     #Then rearrange: Frequency to the front, then ν,μ,ν',μ', so that reshape fuses the appropriate axes
     Π = np.array([
-         [Π[0],Π[1]],
-         [Π[1],Π[2]]
-    ]).transpose((4,2,0,3,1)).reshape(nω,4,4)
-    #Similarly for Q. Here however, the component-axis contains only d and s. This means that one can reshape right-away
+         [Π[0],Π[1],Π[2]],
+         [Π[1],Π[3],Π[4]],
+         [Π[2],Π[4],Π[5]]
+    ]).transpose((4,2,0,3,1)).reshape(nω,6,6)
+    #Similarly for Q. Here however, the component-axis contains only s,px,py. This means that one can reshape right-away
     Q = np.array([
          4*QRξ-2j*ωreg[None,:,None]*QI,
          -4*QIξ-2j*ωreg[None,:,None]*QR
-    ]).transpose((2,3,0,1)).reshape(nω,2,4)
+    ]).transpose((2,3,0,1)).reshape(nω,2,6)
     Qm = np.array([
          4*QRξ+2j*ωreg[None,:,None]*QI,
          -4*QIξ+2j*ωreg[None,:,None]*QR
-    ]).transpose((2,3,0,1)).reshape(nω,2,4)
+    ]).transpose((2,3,0,1)).reshape(nω,2,6)
+    #Qm=Q.conj()
+    ###Renormalize the bubbles due to the phase-integral:
+
+    ##-4 I[|Δ|^2] becomes 8, because the [0] component contains a factor 1/2
+    #kap = -8*(Irr[0]+Iii[0])
+    ###Again, move frequency to the front, then nu,mu and reshape 
+    #Λp = np.array([
+    #    4*Irξ+2j*ωreg*Ii,
+    #    -4*Iiξ+2j*ωreg*Ir
+    #]).transpose((2,0,1)).reshape(nω,6)
+    #Λm = np.array([
+    #    4*Irξ-2j*ωreg*Ii,
+    #    -4*Iiξ-2j*ωreg*Ir
+    #]).transpose((2,0,1)).reshape(nω,6)
+    #Λm = Λp.conj()
+    ##Now renormalize:
+    #print("Renormalizing, by: ")
+    #print(np.mean(abs(Λp[:,:,None]*Λm[:,None,:]/kap[:,None,None])))
+    #print(np.mean(abs(ζ[:,:,None]*Λm[:,None,:]/kap[:,None,None])))
+    #print(np.mean(abs(Qm- ζ[:,:,None]*Λp[:,None,:]/kap[:,None,None])))
+    #print(np.mean(abs(ζ[:,:,None]*ζ[:,None,:]/kap[:,None,None])))
+    #Π = Π - Λp[:,:,None]*Λm[:,None,:]/kap[:,None,None]
+    #Q = Q - ζ[:,:,None]*Λm[:,None,:]/kap[:,None,None]
+    #Qm= Qm- ζ[:,:,None]*Λp[:,None,:]/kap[:,None,None]
+    #Φintegral = Φintegral - ζ[:,:,None]*ζ[:,None,:]/kap[:,None,None]
     return Φintegral,Π,Q,Qm
-def complexChunks(kx,ky,ηs,ηd,ω,dA,**kwargs):
+def simplechunks(kx,ky,η,ω,dA,sign=1,q=np.zeros(2),**kwargs):
     """
-    Calculates all the relevant integrals for complex s,d components. The frequency-array should already contain +iδ.
+    sign should be +1 for the outer block and -1 for the inner block
     """
-    v3 = sq.v3(kx,ky,**kwargs)
-    φd = sq.φvector(kx,ky,choose=np.array([False,True,False,False,False]))[:,0] #(*k)-array
-    Δ = ηd*φd+ηs
-    ξbar,δ,Eplus,Eminus = sq.energy_terms(kx,ky,Δ,**kwargs) #All (*k)-arrays
-    basickernel = (sq.fermi(Eplus,**kwargs)-sq.fermi(Eminus,**kwargs))/δ
-    kernel = basickernel[:,None]/((ω[None,:])**2-4*(δ[:,None])**2)  #(k,w)
-    φcombinations = np.array([φd**2,φd,np.ones_like(φd)])
-    ξbar = ξbar[None,:]
+    v3_0 = sign*rs.v3(kx,ky,**kwargs)
+    v3 =v3_0 + 2*np.array([q[0]*np.cos(kx),q[1]*np.cos(ky)]).transpose()
+    φs,φpx,φpy = rs.φsimplified(kx,ky).transpose()
+    φs = sign*φs.imag
+    
+
+    #Build the gap. The s-wave component has the opposite sign in the inner block,
+    #as required by symmetry
+    Δ = 1j*φs* η[0]+η[1]*φpx+η[2]*φpy
+    ξ0 = rs.ξsquarelattice(kx,ky,**kwargs)+np.dot(v3_0,q)
+    δ = np.sqrt(ξ0**2+abs(Δ)**2)[:,None]
+    #φs *= np.sqrt(renormalization[0])
+    #φpx*= np.sqrt(renormalization[1])
+    #φpy*= np.sqrt(renormalization[2])
+    combi = np.array([φs**2,φpx*φs,φpy*φs,φpx**2,φpx*φpy,φpy**2])
+    #The inner block energies are shifted downwards by γ instead of upwards:
+    γ = sign*np.linalg.norm(rs.γcoupling(kx,ky,**kwargs),axis=0)
+    γ= (γ+ 2*(q[0]*np.sin(kx)+q[1]*np.sin(ky)))[:,None]
+    #Build integration kernels for the outer and inner block:
+    kernel = ((rs.fermi(δ+γ)-rs.fermi(-δ+γ))/δ)/((ω[None,:])**2-4*(δ)**2)
+    #Both are (k,ω)-arrays
+
+    #Calculate all sorts of integrals:
+    #The first axis in all of them represents all required combinations of basisfunctions,
+    #for which that integral needs to be calculated
+    
+    ξ0 = ξ0[None,:]
     Δ = Δ[None,:]
-    Iξξ = dA*np.einsum('ck,kw->cw',(ξbar)**2*φcombinations,kernel) #(c,ω)
-    Iξ = dA*np.einsum('ck,kw->cw',(ξbar)*φcombinations,kernel) #(c,ω)
-    Iii = dA*np.einsum('ck,kw->cw',(Δ.imag)**2*φcombinations,kernel) #(c,ω)
-    Iri = dA*np.einsum('ck,kw->cw',(Δ.imag*Δ.real)*φcombinations,kernel) #(c,ω)
-    Irr = dA*np.einsum('ck,kw->cw',(Δ.real)**2*φcombinations,kernel) #(c,ω)
-    φcombinations = φcombinations[1:]
-    QRξ  = dA*np.einsum('ck,ka,kw->cwa',Δ.real*ξbar*φcombinations,v3,kernel) #(c,ω,x/y)
-    QIξ = dA*np.einsum('ck,ka,kw->cwa',Δ.imag*ξbar*φcombinations,v3,kernel) #(c,ω,x/y)
-    QR = dA*np.einsum('ck,ka,kw->cwa',Δ.real*φcombinations,v3,kernel) #(c,ω,x/y)
-    QI = dA*np.einsum('ck,ka,kw->cwa',Δ.imag*φcombinations,v3,kernel) #(c,ω,x/y)
+    Iξξ = dA*np.einsum('ck,kw->cw',(ξ0)**2*combi,kernel) #(c,ω)
+    Iξ = dA*np.einsum('ck,kw->cw',(ξ0)*combi,kernel) #(c,ω)
+    Iii = dA*np.einsum('ck,kw->cw',(Δ.imag)**2*combi,kernel) #(c,ω)
+    Iri = dA*np.einsum('ck,kw->cw',(Δ.imag*Δ.real)*combi,kernel) #(c,ω)
+    Irr = dA*np.einsum('ck,kw->cw',(Δ.real)**2*combi,kernel) #(c,ω)
+
+    #For the Q-integrals only one basis-function at a time is integrated:
+    combi = combi[:3]*sign*np.sqrt(2) #only the first order basis-functions
+    QRξ  = dA*np.einsum('ck,ka,kw->cwa',Δ.real*ξ0*combi,v3,kernel) #(c,ω,x/y)
+    QIξ = dA*np.einsum('ck,ka,kw->cwa',Δ.imag*ξ0*combi,v3,kernel) #(c,ω,x/y)
+    QR = dA*np.einsum('ck,ka,kw->cwa',Δ.real*combi,v3,kernel) #(c,ω,x/y)
+    QI = dA*np.einsum('ck,ka,kw->cwa',Δ.imag*combi,v3,kernel) #(c,ω,x/y)
+    
+    #Ii = dA*np.einsum('ck,kw->cw',(Δ.imag)*combi,kernel) #(c,ω)
+    #Ir = dA*np.einsum('ck,kw->cw',(Δ.real)*combi,kernel) #(c,ω)
+    #Irξ = dA*np.einsum('ck,kw->cw',(Δ.real*ξ0)*combi,kernel) #(c,ω)
+    #Iiξ = dA*np.einsum('ck,kw->cw',(Δ.imag*ξ0)*combi,kernel) #(c,ω)
+    #
+    #Qabs = dA*np.einsum('ka,kw->wa',abs(Δ[0,:,None])*v3,kernel) #(ω,x/y)
     Φintegral = dA*np.einsum('kw,ka,kb->wab',kernel*abs(Δ[0,:,None])**2,v3,v3)
-    return np.array([Iξξ,Iξ,Iii,Iri,Irr]),np.array([QR,QI,QRξ,QIξ]),Φintegral
+    return np.array([Iξξ,Iξ,Iii,Iri,Irr]),np.array([QR,QI,QRξ,QIξ]),Φintegral#,Qabs,np.array([Ii,Ir,Irξ,Iiξ])
